@@ -30,7 +30,7 @@ from qt.core import (
 )
 
 from calibre import prints
-from calibre.constants import DEBUG, __appname__, get_version, ismacos
+from calibre.constants import DEBUG, __appname__, get_version, is_running_from_develop, ismacos
 from calibre.customize.ui import find_plugin
 from calibre.gui2 import elided_text, open_url
 from calibre.gui2.keyboard import Manager as KeyboardManager
@@ -274,6 +274,15 @@ class Main(MainWindow):
     STATE_VERSION = 0
     undo_requested = pyqtSignal(object)
 
+    @property
+    def dev_title_suffix(self):
+        # Show a small indicator when running from a develop checkout.
+        # This is especially useful on macOS where CALIBRE_DEVELOP_FROM is often
+        # set via launchd for "Open With"/Finder launches.
+        if is_running_from_develop or os.environ.get('CALIBRE_DEVELOP_FROM'):
+            return ' [*DEV*]'
+        return ''
+
     def __init__(self, opts, notify=None):
         MainWindow.__init__(self, opts, disable_automatic_gc=True)
         self.message_popup = MessagePopup(self)
@@ -283,7 +292,7 @@ class Main(MainWindow):
         except Exception:
             import traceback
             traceback.print_exc()
-        self.setWindowTitle(self.APP_NAME)
+        self.setWindowTitle(self.APP_NAME + self.dev_title_suffix)
         self.boss = Boss(self, notify=notify)
         if not ismacos:
             self.setWindowIcon(QApplication.instance().windowIcon())
@@ -853,9 +862,9 @@ class Main(MainWindow):
         cc = current_container()
         if cc is not None:
             fname = os.path.basename(cc.path_to_ebook)
-            self.setWindowTitle(self.current_metadata.title + f' [{cc.book_type_for_display}] :: {fname} :: {self.APP_NAME}')
+            self.setWindowTitle(self.current_metadata.title + f' [{cc.book_type_for_display}] :: {fname} :: {self.APP_NAME}' + self.dev_title_suffix)
         else:
-            self.setWindowTitle(self.APP_NAME)
+            self.setWindowTitle(self.APP_NAME + self.dev_title_suffix)
 
     def closeEvent(self, e):
         if self.boss.quit():
