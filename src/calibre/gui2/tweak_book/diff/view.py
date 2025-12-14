@@ -32,6 +32,7 @@ from qt.core import (
     QScrollBar,
     QSplitter,
     QSplitterHandle,
+    QStyle,
     Qt,
     QTextCharFormat,
     QTextCursor,
@@ -42,6 +43,7 @@ from qt.core import (
 )
 
 from calibre import fit_image, human_readable
+from calibre.constants import ismacos
 from calibre.gui2 import info_dialog
 from calibre.gui2.tweak_book import tprefs
 from calibre.gui2.tweak_book.diff import get_sequence_matcher
@@ -939,6 +941,41 @@ class DiffView(QWidget):  # {{{
         l.addWidget(self.view)
         self.add_diff = self.view.add_diff
         self.scrollbar = QScrollBar(self)
+        # On macOS, Qt can use "transient" (overlay/fading) scrollbars based on
+        # system preferences. In this diff view, transient scrollbars can cause
+        # repeated layout/scroll churn even when the user is idle. Force a
+        # non-transient scrollbar for this widget only.
+        if ismacos:
+            try:
+                from calibre_extensions.progress_indicator import CalibreStyle
+            except Exception:
+                CalibreStyle = None
+            if CalibreStyle is not None:
+                self._non_transient_scrollbar_style = CalibreStyle(0)
+                self._non_transient_scrollbar_style.setParent(self.scrollbar)
+                self.scrollbar.setStyle(self._non_transient_scrollbar_style)
+        # Also reserve a stable width for the scrollbar so it never changes the
+        # layout when shown/hidden by the platform style.
+        try:
+            sb_width = self.scrollbar.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        except Exception:
+            sb_width = None
+        if sb_width:
+            # Make it a bit slimmer on macOS while keeping the layout stable.
+            w = int(sb_width)
+            if ismacos:
+                w = max(10, min(w, 12))
+            self.scrollbar.setFixedWidth(w)
+            if ismacos:
+                r = max(2, (w // 2) - 1)
+                self.scrollbar.setStyleSheet(
+                    'QScrollBar:vertical{background:transparent;min-width:%dpx;max-width:%dpx;margin:0px;}'
+                    'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}'
+                    'QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}'
+                    'QScrollBar::handle:vertical{min-height:20px;background:rgba(128,128,128,120);border-radius:%dpx;}'
+                    'QScrollBar::handle:vertical:hover{background:rgba(128,128,128,180);}'
+                    % (w, w, r)
+                )
         l.addWidget(self.scrollbar)
         self.syncing = False
         self.bars = []
