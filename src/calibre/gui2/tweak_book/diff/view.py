@@ -32,6 +32,7 @@ from qt.core import (
     QScrollBar,
     QSplitter,
     QSplitterHandle,
+    QStyle,
     Qt,
     QTextCharFormat,
     QTextCursor,
@@ -42,6 +43,7 @@ from qt.core import (
 )
 
 from calibre import fit_image, human_readable
+from calibre.constants import ismacos
 from calibre.gui2 import info_dialog
 from calibre.gui2.tweak_book import tprefs
 from calibre.gui2.tweak_book.diff import get_sequence_matcher
@@ -120,6 +122,13 @@ class TextBrowser(PlainTextEdit):  # {{{
 
     def __init__(self, right=False, parent=None, show_open_in_editor=False):
         PlainTextEdit.__init__(self, parent)
+        self._overlay_scrollbar_extent = 0
+        if ismacos:
+            try:
+                if self.style().styleHint(QStyle.StyleHint.SH_ScrollBar_Transient, widget=self):
+                    self._overlay_scrollbar_extent = max(0, int(self.verticalScrollBar().sizeHint().width()))
+            except Exception:
+                self._overlay_scrollbar_extent = 0
         self.setFrameStyle(0)
         self.show_open_in_editor = show_open_in_editor
         self.side_margin = 0
@@ -160,7 +169,11 @@ class TextBrowser(PlainTextEdit):  # {{{
         self.line_number_map = LineNumberMap()
         self.search_header_pos = 0
         self.changes, self.headers, self.images = [], [], OrderedDict()
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff), self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if ismacos:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.diff_backgrounds = {
             'replace' : theme_color(theme, 'DiffReplace', 'bg'),
             'insert'  : theme_color(theme, 'DiffInsert', 'bg'),
@@ -281,17 +294,18 @@ class TextBrowser(PlainTextEdit):  # {{{
         del self.headers[:]
         self.images.clear()
         self.search_header_pos = 0
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
     def update_line_number_area_width(self, block_count=0):
         self.side_margin = self.line_number_area_width()
         if self.right:
-            self.setViewportMargins(0, 0, self.side_margin, 0)
+            self.setViewportMargins(0, 0, self.side_margin + self._overlay_scrollbar_extent, 0)
         else:
-            self.setViewportMargins(self.side_margin, 0, 0, 0)
+            self.setViewportMargins(self.side_margin, 0, self._overlay_scrollbar_extent, 0)
 
     def available_width(self):
-        return self.width() - self.side_margin
+        # Use the viewport width so scrollbar presence never skews calculations.
+        return self.viewport().width()
 
     def line_number_area_width(self):
         return 9 + (self.line_number_map.max_width * self.number_width)
@@ -306,11 +320,14 @@ class TextBrowser(PlainTextEdit):  # {{{
 
     def resizeEvent(self, ev):
         PlainTextEdit.resizeEvent(self, ev)
-        cr = self.contentsRect()
+        w = self.line_number_area_width()
         if self.right:
-            self.line_number_area.setGeometry(QRect(cr.right() - self.line_number_area_width(), cr.top(), cr.right(), cr.height()))
+            cr = self.contentsRect()
+            x = cr.right() - self._overlay_scrollbar_extent - w + 1
+            self.line_number_area.setGeometry(QRect(x, cr.top(), w, cr.height()))
         else:
-            self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
+            cr = self.contentsRect()
+            self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), w, cr.height()))
         self.resized.emit()
 
     def paint_line_numbers(self, ev):
@@ -338,10 +355,10 @@ class TextBrowser(PlainTextEdit):  # {{{
                 if text == '-':
                     painter.drawLine(r.left() + 2, (top + bottom)//2, r.right() - 2, (top + bottom)//2)
                 elif self.right:
-                    painter.drawText(r.left() + 3, top, r.right(), self.fontMetrics().height(),
+                    painter.drawText(r.left() + 3, top, r.width() - 3, self.fontMetrics().height(),
                             Qt.AlignmentFlag.AlignLeft, text)
                 else:
-                    painter.drawText(r.left() + 2, top, r.right() - 5, self.fontMetrics().height(),
+                    painter.drawText(r.left() + 2, top, r.width() - 7, self.fontMetrics().height(),
                             Qt.AlignmentFlag.AlignRight, text)
                 if is_start:
                     painter.restore()
@@ -407,6 +424,8 @@ class TextBrowser(PlainTextEdit):  # {{{
             painter.drawLine(0, int(bottom - 1), int(w), int(bottom - 1))
 
     def wheelEvent(self, ev):
+        if ismacos and ev.angleDelta().x() == 0:
+            return PlainTextEdit.wheelEvent(self, ev)
         if ev.angleDelta().x() == 0:
             self.wheel_event.emit(ev)
         else:
@@ -938,8 +957,14 @@ class DiffView(QWidget):  # {{{
         self.view = DiffSplit(self, show_open_in_editor=show_open_in_editor)
         l.addWidget(self.view)
         self.add_diff = self.view.add_diff
+        # "Master" scrollbar is only for scroll sync math. On macOS we keep it
+        # out of the layout; using an unparented QWidget can crash at shutdown
+        # due to destruction order on Qt/macOS.
         self.scrollbar = QScrollBar(self)
-        l.addWidget(self.scrollbar)
+        if ismacos:
+            self.scrollbar.hide()
+        else:
+            l.addWidget(self.scrollbar)
         self.syncing = False
         self.bars = []
         self.resize_timer = QTimer(self)
@@ -951,7 +976,11 @@ class DiffView(QWidget):  # {{{
             connect_lambda(bar.valueChanged[int], self, lambda self: self.scrolled(self.sender().scroll_idx))
         self.view.left.resized.connect(self.resized)
         for v in (self.view.left, self.view.right, self.view.handle(1)):
-            v.wheel_event.connect(self.scrollbar.wheelEvent)
+            if ismacos:
+                if v is self.view.handle(1):
+                    v.wheel_event.connect(self.view.left.wheelEvent)
+            else:
+                v.wheel_event.connect(self.scrollbar.wheelEvent)
             if v is self.view.left or v is self.view.right:
                 v.next_change.connect(self.next_change)
                 v.line_activated.connect(self.line_activated)
@@ -1060,7 +1089,10 @@ class DiffView(QWidget):  # {{{
         self.scrollbar.setPageStep(min(ls.pageStep(), rs.pageStep()))
         self.scrollbar.setSingleStep(min(ls.singleStep(), rs.singleStep()))
         self.scrollbar.setRange(0, ls.maximum() + self.delta)
-        self.scrollbar.setVisible(self.view.left.document().lineCount() > ls.pageStep() or self.view.right.document().lineCount() > rs.pageStep())
+        if ismacos:
+            self.scrollbar.hide()
+        else:
+            self.scrollbar.setVisible(self.view.left.document().lineCount() > ls.pageStep() or self.view.right.document().lineCount() > rs.pageStep())
         self.syncpos = ceil(self.scrollbar.pageStep() * self.SYNC_POSITION)
 
     def finalize(self):
