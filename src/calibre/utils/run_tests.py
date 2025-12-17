@@ -286,6 +286,8 @@ def find_tests(which_tests=None, exclude_tests=None):
     if ok('misc'):
         from calibre.ebooks.html.input import find_tests
         a(find_tests())
+        from calibre.gui2.tweak_book.html_text_content import find_tests
+        a(find_tests())
         from calibre.ebooks.metadata.test_author_sort import find_tests
         a(find_tests())
         from calibre.ebooks.metadata.tag_mapper import find_tests

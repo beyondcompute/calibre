@@ -39,6 +39,7 @@ from qt.core import (
     QStackedLayout,
     QStyledItemDelegate,
     Qt,
+    QTextCursor,
     QTimer,
     QToolBar,
     QToolButton,
@@ -57,10 +58,17 @@ from calibre.gui2.tweak_book import current_container, editors, tprefs
 from calibre.gui2.tweak_book.editor.snippets import KEY, MODIFIER, SnippetTextEdit, find_matching_snip, parse_template, string_length
 from calibre.gui2.tweak_book.function_replace import Function, FunctionBox, FunctionEditor, remove_function
 from calibre.gui2.tweak_book.function_replace import functions as replace_functions
+from calibre.gui2.tweak_book.html_text_content import (
+    find_first_match_span,
+    find_last_match_span,
+    python_index_from_utf16_offset,
+    replace_in_text_and_attributes,
+    span_is_replaceable,
+)
 from calibre.gui2.widgets import BusyCursor
 from calibre.gui2.widgets2 import FlowLayout, HistoryComboBox
 from calibre.startup import connect_lambda
-from calibre.utils.icu import primary_contains
+from calibre.utils.icu import primary_contains, utf16_length
 from polyglot.builtins import error_message
 
 # The search panel {{{
@@ -154,21 +162,41 @@ class WhereBox(QComboBox):
 
     def __init__(self, parent, emphasize=False):
         QComboBox.__init__(self)
-        self.addItems([_('Current file'), _('All text files'), _('All style files'), _('Selected files'), _('Open files'), _('Marked text')])
+        self.items = (
+            ('current', _('Current file')),
+            ('current-content', _('Current file (text content)')),
+            ('text', _('All text files')),
+            ('text-content', _('All text files (text content)')),
+            ('styles', _('All style files')),
+            ('selected', _('Selected files')),
+            ('selected-content', _('Selected files (text content)')),
+            ('open', _('Open files')),
+            ('open-content', _('Open files (text content)')),
+            ('selected-text', _('Marked text')),
+        )
+        self.addItems([x[1] for x in self.items])
         self.setToolTip('<style>dd {margin-bottom: 1.5ex}</style>' + _(
             '''
             Where to search/replace:
             <dl>
             <dt><b>Current file</b></dt>
             <dd>Search only inside the currently opened file</dd>
+            <dt><b>Current file (text content)</b></dt>
+            <dd>Search only inside the textual content of the currently opened HTML file (tags are ignored; includes title/alt attributes)</dd>
             <dt><b>All text files</b></dt>
             <dd>Search in all text (HTML) files</dd>
+            <dt><b>All text files (text content)</b></dt>
+            <dd>Search in the textual content of all HTML files (tags are ignored; includes title/alt attributes)</dd>
             <dt><b>All style files</b></dt>
             <dd>Search in all style (CSS) files</dd>
             <dt><b>Selected files</b></dt>
             <dd>Search in the files currently selected in the File browser</dd>
+            <dt><b>Selected files (text content)</b></dt>
+            <dd>Search in the textual content of the selected HTML files (tags are ignored; includes title/alt attributes)</dd>
             <dt><b>Open files</b></dt>
             <dd>Search in the files currently open in the editor</dd>
+            <dt><b>Open files (text content)</b></dt>
+            <dd>Search in the textual content of the open HTML files (tags are ignored; includes title/alt attributes)</dd>
             <dt><b>Marked text</b></dt>
             <dd>Search only within the marked text in the currently opened file. You can mark text using the Search menu.</dd>
             </dl>'''))
@@ -181,13 +209,11 @@ class WhereBox(QComboBox):
 
     @property
     def where(self):
-        wm = {0:'current', 1:'text', 2:'styles', 3:'selected', 4:'open', 5:'selected-text'}
-        return wm[self.currentIndex()]
+        return self.items[self.currentIndex()][0]
 
     @where.setter
     def where(self, val):
-        wm = {0:'current', 1:'text', 2:'styles', 3:'selected', 4:'open', 5:'selected-text'}
-        self.setCurrentIndex({v:k for k, v in wm.items()}[val])
+        self.setCurrentIndex({v: k for k, (v, __) in enumerate(self.items)}[val])
 
     def showPopup(self):
         # We do it like this so that the popup uses a normal font
@@ -1296,11 +1322,17 @@ class SavedSearches(QWidget):
 def validate_search_request(name, searchable_names, has_marked_text, state, gui_parent):
     err = None
     where = state['where']
-    if name is None and where in {'current', 'selected-text'}:
+    base_where = {
+        'current-content': 'current',
+        'text-content': 'text',
+        'selected-content': 'selected',
+        'open-content': 'open',
+    }.get(where, where)
+    if name is None and base_where in {'current', 'selected-text'}:
         err = _('No file is being edited.')
-    elif where == 'selected' and not searchable_names['selected']:
+    elif base_where == 'selected' and not searchable_names['selected']:
         err = _('No files are selected in the File browser')
-    elif where == 'selected-text' and not has_marked_text:
+    elif base_where == 'selected-text' and not has_marked_text:
         err = _('No text is marked. First select some text, and then use'
                 ' The "Mark selected text" action in the Search menu to mark it.')
     if not err and not state['find']:
@@ -1365,13 +1397,19 @@ def get_search_name(state):
 def initialize_search_request(state, action, current_editor, current_editor_name, searchable_names):
     editor = None
     where = state['where']
+    base_where = {
+        'current-content': 'current',
+        'text-content': 'text',
+        'selected-content': 'selected',
+        'open-content': 'open',
+    }.get(where, where)
     files = OrderedDict()
     do_all = state.get('wrap') or action in {'replace-all', 'count'}
     marked = False
-    if where == 'current':
+    if base_where == 'current':
         editor = current_editor
-    elif where in {'styles', 'text', 'selected', 'open'}:
-        files = searchable_names[where]
+    elif base_where in {'styles', 'text', 'selected', 'open'}:
+        files = searchable_names[base_where]
         if current_editor_name in files:
             # Start searching in the current editor
             editor = current_editor
@@ -1426,6 +1464,7 @@ def run_search(
 
     editor, where, files, do_all_, marked = initialize_search_request(searches[0], action, current_editor, current_editor_name, searchable_names)
     wrap = searches[0]['wrap']
+    content_mode = where.endswith('-content')
 
     errfind = searches[0]['find']
     if len(searches) > 1:
@@ -1454,26 +1493,98 @@ def run_search(
             gui_parent, _('Not found'), msg, show=True)
 
     def do_find():
+        if not content_mode:
+            for p, __ in searches:
+                if editor is not None:
+                    if editor.find(p, marked=marked, save_match='gui'):
+                        return True
+                    if wrap and not files and editor.find(p, wrap=True, marked=marked, save_match='gui'):
+                        return True
+                for fname, syntax in files.items():
+                    ed = editors.get(fname, None)
+                    if ed is not None:
+                        if not wrap and ed is editor:
+                            continue
+                        if ed.find(p, complete=True, save_match='gui'):
+                            show_editor(fname)
+                            return True
+                    else:
+                        raw = current_container().raw_data(fname)
+                        if p.search(raw) is not None:
+                            edit_file(fname, syntax)
+                            if editors[fname].find(p, complete=True, save_match='gui'):
+                                return True
+            return no_match()
+
+        if marked:
+            return error_dialog(gui_parent, _('Cannot search'), _(
+                'Searching in text content is not supported for marked text.'), show=True)
+
+        def load_raw(fname):
+            if fname in editors:
+                return editors[fname].get_raw_data()
+            raw = current_container().raw_data(fname)
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', 'replace')
+            return raw
+
+        def select_span(fname, raw, start, end):
+            ed = editors[fname]
+            c = ed.editor.textCursor()
+            s = utf16_length(raw[:start])
+            e = utf16_length(raw[:end])
+            c.setPosition(s)
+            c.setPosition(e, QTextCursor.MoveMode.KeepAnchor)
+            ed.editor.setTextCursor(c)
+            ed.editor.ensureCursorVisible()
+
+        direction = searches[0][0].flags
+        searching_up = bool(direction & regex.REVERSE)
+
         for p, __ in searches:
             if editor is not None:
-                if editor.find(p, marked=marked, save_match='gui'):
-                    return True
-                if wrap and not files and editor.find(p, wrap=True, marked=marked, save_match='gui'):
-                    return True
-            for fname, syntax in files.items():
-                ed = editors.get(fname, None)
-                if ed is not None:
-                    if not wrap and ed is editor:
-                        continue
-                    if ed.find(p, complete=True, save_match='gui'):
-                        show_editor(fname)
-                        return True
+                if getattr(editor, 'syntax', None) != 'html':
+                    return error_dialog(gui_parent, _('Cannot search'), _(
+                        'Searching in text content is only supported for HTML files.'), show=True)
+                raw = editor.get_raw_data()
+                tc = editor.editor.textCursor()
+                # Match the behavior of QTextDocument.find(): when searching
+                # upwards, search before the start of the current selection;
+                # when searching downwards, search after the end.
+                if tc.hasSelection():
+                    cur_start = min(tc.anchor(), tc.position())
+                    cur_end = max(tc.anchor(), tc.position())
                 else:
-                    raw = current_container().raw_data(fname)
-                    if p.search(raw) is not None:
-                        edit_file(fname, syntax)
-                        if editors[fname].find(p, complete=True, save_match='gui'):
-                            return True
+                    cur_start = cur_end = tc.position()
+                if searching_up:
+                    span = find_last_match_span(raw, p, end_at_utf16=cur_start)
+                else:
+                    span = find_first_match_span(raw, p, start_at_utf16=cur_end)
+                if span is not None:
+                    select_span(current_editor_name, raw, *span)
+                    return True
+                if wrap and not files:
+                    span = find_last_match_span(raw, p) if searching_up else find_first_match_span(raw, p)
+                    if span is not None:
+                        select_span(current_editor_name, raw, *span)
+                        return True
+
+            for fname, syntax in files.items():
+                if syntax != 'html':
+                    continue
+                if editor is not None and fname == current_editor_name and not wrap:
+                    continue
+                raw = load_raw(fname)
+                span = find_last_match_span(raw, p) if searching_up else find_first_match_span(raw, p)
+                if span is None:
+                    continue
+                if fname not in editors:
+                    edit_file(fname, syntax)
+                else:
+                    show_editor(fname)
+                select_span(fname, load_raw(fname), *span)
+                return True
+
         return no_match()
 
     def no_replace(prefix=''):
@@ -1488,17 +1599,66 @@ def run_search(
     def do_replace():
         if editor is None:
             return no_replace()
+        if not content_mode:
+            for p, repl in searches:
+                repl_is_func = isinstance(repl, Function)
+                if repl_is_func:
+                    repl.init_env(current_editor_name)
+                if editor.replace(p, repl, saved_match='gui'):
+                    if repl_is_func:
+                        repl.end()
+                        show_function_debug_output(repl)
+                    return True
+            return no_replace(_(
+                    'Currently selected text does not match the search query.'))
+
+        if marked:
+            return error_dialog(gui_parent, _('Cannot replace'), _(
+                'Replacing in text content is not supported for marked text.'), show=True)
+        if getattr(editor, 'syntax', None) != 'html':
+            return error_dialog(gui_parent, _('Cannot replace'), _(
+                'Replacing in text content is only supported for HTML files.'), show=True)
+
+        raw = editor.get_raw_data()
+        c = editor.editor.textCursor()
+        if not c.hasSelection():
+            return no_replace()
+        start_u16, end_u16 = sorted((c.anchor(), c.position()))
+        start = python_index_from_utf16_offset(raw, start_u16)
+        end = python_index_from_utf16_offset(raw, end_u16)
+        if not span_is_replaceable(raw, start, end):
+            return no_replace(_(
+                'The selected text is not in HTML text content or supported attributes.'))
+        selected = raw[start:end]
+
         for p, repl in searches:
             repl_is_func = isinstance(repl, Function)
             if repl_is_func:
                 repl.init_env(current_editor_name)
-            if editor.replace(p, repl, saved_match='gui'):
+            m = p.fullmatch(selected)
+            if m is None:
                 if repl_is_func:
                     repl.end()
-                    show_function_debug_output(repl)
-                return True
+                continue
+            replaced, num = p.subn(repl, selected, count=1)
+            if repl_is_func:
+                repl.end()
+                show_function_debug_output(repl)
+            if not num:
+                continue
+            raw = raw[:start] + replaced + raw[end:]
+            editor.replace_data(raw, only_if_different=False)
+            ns = utf16_length(raw[:start])
+            ne = ns + utf16_length(replaced)
+            nc = editor.editor.textCursor()
+            nc.setPosition(ns)
+            nc.setPosition(ne, QTextCursor.MoveMode.KeepAnchor)
+            editor.editor.setTextCursor(nc)
+            editor.editor.ensureCursorVisible()
+            return True
+
         return no_replace(_(
-                'Currently selected text does not match the search query.'))
+            'Currently selected text does not match the search query.'))
 
     def count_message(replaced, count, show_diff=False, show_dialog=True, count_map=None):
         if show_dialog:
@@ -1528,7 +1688,11 @@ def run_search(
         count_map = Counter()
         if not files and editor is None:
             return 0
-        lfiles = files or {current_editor_name:editor.syntax}
+        lfiles = files or {current_editor_name: editor.syntax}
+        if content_mode:
+            lfiles = OrderedDict((n, s) for n, s in lfiles.items() if s == 'html')
+            if not lfiles:
+                return 0
         updates = set()
         raw_data = {}
         for n in lfiles:
@@ -1536,6 +1700,8 @@ def run_search(
                 raw = editors[n].get_raw_data()
             else:
                 raw = current_container().raw_data(n)
+                if isinstance(raw, bytes):
+                    raw = raw.decode('utf-8', 'replace')
             raw_data[n] = raw
 
         for search_name, (p, repl) in zip(search_names, searches):
@@ -1550,12 +1716,18 @@ def run_search(
                 if replace:
                     if repl_is_func:
                         repl.context_name = n
-                    raw, num = p.subn(repl, raw)
+                    if content_mode:
+                        raw, num = replace_in_text_and_attributes(raw, p, repl)
+                    else:
+                        raw, num = p.subn(repl, raw)
                     if num > 0:
                         updates.add(n)
                         raw_data[n] = raw
                 else:
-                    num = len(p.findall(raw))
+                    if content_mode:
+                        __, num = replace_in_text_and_attributes(raw, p, repl, replace=False)
+                    else:
+                        num = len(p.findall(raw))
                 count += num
                 count_map[search_name] += num
             if repl_is_func:
