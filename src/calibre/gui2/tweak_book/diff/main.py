@@ -24,6 +24,7 @@ from qt.core import (
     QPainter,
     QRadioButton,
     QRect,
+    QShortcut,
     QSize,
     QStackedLayout,
     Qt,
@@ -250,6 +251,8 @@ class Diff(Dialog):
             self.setWindowFlags(Qt.WindowType.Window)
         else:
             self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
+        self.close_shortcut = s = QShortcut(QKeySequence(QKeySequence.StandardKey.Close), self)
+        s.activated.connect(self.reject)
         self.stacks = st = QStackedLayout(self)
         self.busy = BusyWidget(self)
         self.w = QWidget(self)
